@@ -4,10 +4,16 @@ const sqlite3 = require('sqlite3').verbose();
 const WebSocket = require('ws');
 const path = require('path');
 const SMSService = require('./smsService');
+const ArduinoManager = require('./arduinoManager');
 
 const app = express();
 const PORT = 5000;
 const smsService = new SMSService();
+const arduinoManager = new ArduinoManager();
+
+// Active location that Arduino readings should be associated with.
+// Defaults to first location (id = 1) but can be overridden when connecting.
+let arduinoLocationId = 1;
 
 // Middleware
 app.use(cors());
@@ -113,6 +119,52 @@ function initializeDatabase() {
   });
 }
 
+// Setup Arduino data handling
+arduinoManager.onData(async (reading) => {
+  try {
+    console.log('📡 Received Arduino reading:', reading);
+    
+    const riskLevel = getRiskLevel(reading.distance);
+    
+    // Save to database with explicit Nepal timestamp
+    db.run(
+      'INSERT INTO sensor_readings (distance, risk_level, location_id, timestamp) VALUES (?, ?, ?, ?)',
+      [reading.distance, riskLevel, arduinoLocationId, reading.timestamp], // Use Arduino's Nepal timestamp and active location
+      async function(err) {
+        if (err) {
+          console.error('❌ Error saving Arduino reading:', err);
+        } else {
+          console.log(`✅ Saved Arduino reading: ${reading.distance}cm (${riskLevel}) at ${reading.timestamp} for location ${arduinoLocationId}`);
+          
+          // Broadcast to WebSocket clients
+          broadcastReading({
+            id: this.lastID,
+            distance: reading.distance,
+            riskLevel: riskLevel,
+            timestamp: reading.timestamp,
+            source: 'arduino',
+            location_id: arduinoLocationId
+          });
+          
+          // Check for alerts (per-location contacts)
+          await checkAndSendAlert(reading.distance, riskLevel, arduinoLocationId);
+          
+          // Update daily stats
+          updateDailyStats(arduinoLocationId);
+        }
+      }
+    );
+  } catch (error) {
+    console.error('❌ Error processing Arduino data:', error);
+  }
+});
+
+// Helper function to get Nepal time
+function getNepalTime() {
+  const now = new Date();
+  return new Date(now.getTime() + (5.75 * 60 * 60 * 1000));
+}
+
 // Helper function to determine risk level
 function getRiskLevel(distance) {
   if (distance < 50) return 'DANGER';
@@ -122,32 +174,131 @@ function getRiskLevel(distance) {
 
 // API Routes
 
+// Arduino Management Endpoints
+app.get('/api/arduino/ports', async (req, res) => {
+  try {
+    console.log('🔍 Listing available serial ports...');
+    const ports = await arduinoManager.listPorts();
+    console.log('📋 Available ports:', ports);
+    res.json({ success: true, ports });
+  } catch (error) {
+    console.error('❌ Error listing ports:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/arduino/connect', async (req, res) => {
+  try {
+    console.log('🔌 Attempting Arduino connection...');
+    const { port, location_id } = req.body;
+    console.log('📍 Connecting to port:', port || 'auto-detect');
+    if (location_id) {
+      arduinoLocationId = location_id;
+      console.log(`📍 Arduino readings will be stored for location_id=${arduinoLocationId}`);
+    }
+
+    const currentStatus = arduinoManager.getStatus();
+
+    // If already connected, don't try to reopen the port – just update location
+    if (currentStatus.isConnected) {
+      console.log('ℹ️ Arduino already connected, reusing existing connection.');
+      return res.json({
+        success: true,
+        message: 'Arduino already connected, location updated',
+        status: { ...currentStatus },
+        location_id: arduinoLocationId
+      });
+    }
+
+    await arduinoManager.connect(port);
+    const status = arduinoManager.getStatus();
+    
+    console.log('✅ Arduino connection successful:', status);
+    res.json({ 
+      success: true, 
+      message: 'Arduino connected successfully',
+      status: status,
+      location_id: arduinoLocationId
+    });
+  } catch (error) {
+    console.error('❌ Arduino connection failed:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/arduino/disconnect', async (req, res) => {
+  try {
+    await arduinoManager.disconnect();
+    arduinoLocationId = 1; // reset to default when fully disconnected
+    res.json({ success: true, message: 'Arduino disconnected' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/arduino/status', (req, res) => {
+  const status = arduinoManager.getStatus();
+  res.json({ success: true, ...status, location_id: arduinoLocationId });
+});
+
+// Debug endpoint to check database contents
+app.get('/api/debug/readings', (req, res) => {
+  db.all(
+    'SELECT COUNT(*) as total, MAX(timestamp) as latest FROM sensor_readings',
+    [],
+    (err, countResult) => {
+      if (err) {
+        res.status(500).json({ error: err.message });
+        return;
+      }
+      
+      db.all(
+        'SELECT * FROM sensor_readings ORDER BY timestamp DESC LIMIT 5',
+        [],
+        (err, recentRows) => {
+          if (err) {
+            res.status(500).json({ error: err.message });
+          } else {
+            res.json({
+              total: countResult[0].total,
+              latest: countResult[0].latest,
+              recent: recentRows
+            });
+          }
+        }
+      );
+    }
+  );
+});
+
 // Save new sensor reading
 app.post('/api/readings', async (req, res) => {
-  const { distance } = req.body;
+  const { distance, location_id } = req.body;
   const riskLevel = getRiskLevel(distance);
+  const nepalTimestamp = getNepalTime().toISOString();
   
   db.run(
-    'INSERT INTO sensor_readings (distance, risk_level) VALUES (?, ?)',
-    [distance, riskLevel],
+    'INSERT INTO sensor_readings (distance, risk_level, location_id, timestamp) VALUES (?, ?, ?, ?)',
+    [distance, riskLevel, location_id || null, nepalTimestamp],
     async function(err) {
       if (err) {
         console.error('Error saving reading:', err);
         res.status(500).json({ error: 'Failed to save reading' });
       } else {
-        console.log(`Saved reading: ${distance}cm (${riskLevel})`);
+        console.log(`✅ Saved reading: ${distance}cm (${riskLevel}) for location: ${location_id || 'default'} at Nepal time`);
         
-        // Check if SMS alert should be sent
-        await checkAndSendAlert(distance, riskLevel);
+        // Check if SMS alert should be sent (per-location contacts)
+        await checkAndSendAlert(distance, riskLevel, location_id || null);
         
         // Update daily stats
-        updateDailyStats();
+        updateDailyStats(location_id);
         
         res.json({ 
           id: this.lastID, 
           distance, 
           riskLevel,
-          timestamp: new Date().toISOString()
+          location_id: location_id || null,
+          timestamp: nepalTimestamp
         });
       }
     }
@@ -176,12 +327,66 @@ app.post('/api/sms/test', async (req, res) => {
 
 // Manual alert endpoint
 app.post('/api/alerts/send', async (req, res) => {
-  const { phone, distance, riskLevel } = req.body;
+  const { phone, distance, riskLevel, location_id } = req.body;
   
   try {
+    // If a specific phone is provided, send only to that phone
+    if (phone) {
+      const result = await smsService.sendLandslideAlert(phone, distance, riskLevel);
+      return res.json({
+        success: true,
+        message: 'Alert sent successfully',
+        data: result
+      });
+    }
+
+    // If a location_id is provided, send to all active contacts for that location
+    if (location_id) {
+      db.all(
+        'SELECT phone FROM notification_contacts WHERE location_id = ? AND active = 1 ORDER BY priority, name',
+        [location_id],
+        async (err, rows) => {
+          if (err) {
+            console.error('Error fetching contacts for manual alert:', err);
+            return res.status(500).json({
+              success: false,
+              message: 'Failed to fetch contacts for alert',
+              error: err.message
+            });
+          }
+
+          const phones = rows.map(r => r.phone);
+          const targets = phones.length > 0 ? phones : [alertSettings.phone];
+
+          try {
+            const results = [];
+            for (const p of targets) {
+              const result = await smsService.sendLandslideAlert(p, distance, riskLevel);
+              results.push({ phone: p, result });
+            }
+
+            return res.json({
+              success: true,
+              message: `Alert sent to ${targets.length} recipient(s)`,
+              data: results
+            });
+          } catch (sendError) {
+            console.error('Error sending manual alerts to contacts:', sendError);
+            return res.status(500).json({
+              success: false,
+              message: 'Failed to send alert to one or more contacts',
+              error: sendError.message
+            });
+          }
+        }
+      );
+      return;
+    }
+
+    // Fallback: send to global alert phone
     const result = await smsService.sendLandslideAlert(
-      phone || alertSettings.phone, 
-      distance, 
+      alertSettings.phone,
+      distance,
       riskLevel
     );
     res.json({
@@ -446,8 +651,8 @@ app.put('/api/alert/settings', (req, res) => {
   });
 });
 
-// Function to check and send alerts
-async function checkAndSendAlert(distance, riskLevel) {
+// Function to check and send alerts (supports per-location contacts)
+async function checkAndSendAlert(distance, riskLevel, locationId = null) {
   // Only send if auto-alerts are enabled and specific risk level is enabled
   if (!smsAutoAlertSettings.enabled) {
     console.log(`Auto-alerts disabled. Skipping ${riskLevel} alert for distance: ${distance}cm`);
@@ -465,33 +670,77 @@ async function checkAndSendAlert(distance, riskLevel) {
   }
 
   const now = Date.now();
-  const lastAlert = lastAlertTime[riskLevel] || 0;
+  const key = `${locationId || 'global'}:${riskLevel}`;
+  const lastAlert = lastAlertTime[key] || 0;
   
   // Send alert for DANGER immediately, WARNING/SAFE with cooldown
   if (riskLevel === 'DANGER' || (now - lastAlert) > alertSettings.cooldown) {
-    try {
-      await smsService.sendLandslideAlert(alertSettings.phone, distance, riskLevel);
-      lastAlertTime[riskLevel] = now;
-      console.log(`✅ Auto ${riskLevel} alert sent for distance: ${distance}cm`);
-    } catch (error) {
-      console.error('Failed to send automatic alert:', error);
+    const sendToPhones = async (phones) => {
+      for (const phone of phones) {
+        try {
+          await smsService.sendLandslideAlert(phone, distance, riskLevel);
+          console.log(`✅ Auto ${riskLevel} alert sent to ${phone} for distance: ${distance}cm`);
+        } catch (error) {
+          console.error(`Failed to send automatic alert to ${phone}:`, error);
+        }
+      }
+    };
+
+    if (locationId) {
+      // Send to all active contacts for this location; fallback to global phone if none
+      await new Promise((resolve) => {
+        db.all(
+          'SELECT phone FROM notification_contacts WHERE location_id = ? AND active = 1 ORDER BY priority, name',
+          [locationId],
+          async (err, rows) => {
+            if (err) {
+              console.error('Error fetching contacts for auto-alert:', err);
+              await sendToPhones([alertSettings.phone]);
+              lastAlertTime[key] = now;
+              return resolve();
+            }
+
+            const phones = rows.map(r => r.phone);
+            const targets = phones.length > 0 ? phones : [alertSettings.phone];
+            await sendToPhones(targets);
+            lastAlertTime[key] = now;
+            resolve();
+          }
+        );
+      });
+    } else {
+      // No specific location, send only to global phone
+      await sendToPhones([alertSettings.phone]);
+      lastAlertTime[key] = now;
     }
   } else {
-    console.log(`${riskLevel} alert on cooldown. Last sent: ${Math.round((now - lastAlert) / 1000)}s ago`);
+    console.log(`${riskLevel} alert on cooldown for ${locationId || 'global'}. Last sent: ${Math.round((now - lastAlert) / 1000)}s ago`);
   }
 }
 
 // Get recent readings
 app.get('/api/readings', (req, res) => {
   const limit = req.query.limit || 50;
+  const locationId = req.query.location_id ? parseInt(req.query.location_id, 10) : null;
   
+  console.log(`📊 Fetching ${limit} recent readings...`);
+  console.log(locationId ? `🔎 Filtering by location_id=${locationId}` : '🔎 No location filter (all locations)');
+
+  const baseQuery = 'SELECT * FROM sensor_readings';
+  const whereClause = locationId ? ' WHERE location_id = ?' : '';
+  const orderLimit = ' ORDER BY timestamp DESC LIMIT ?';
+
+  const params = locationId ? [locationId, limit] : [limit];
+
   db.all(
-    'SELECT * FROM sensor_readings ORDER BY timestamp DESC LIMIT ?',
-    [limit],
+    baseQuery + whereClause + orderLimit,
+    params,
     (err, rows) => {
       if (err) {
+        console.error('❌ Error fetching readings:', err);
         res.status(500).json({ error: 'Failed to fetch readings' });
       } else {
+        console.log(`✅ Found ${rows.length} readings in database`);
         res.json(rows);
       }
     }
@@ -500,11 +749,18 @@ app.get('/api/readings', (req, res) => {
 
 // Get readings by date range
 app.get('/api/readings/range', (req, res) => {
-  const { startDate, endDate } = req.query;
+  const { startDate, endDate, location_id } = req.query;
+  const locationId = location_id ? parseInt(location_id, 10) : null;
+
+  const baseQuery = 'SELECT * FROM sensor_readings WHERE DATE(timestamp) BETWEEN ? AND ?';
+  const whereLocation = locationId ? ' AND location_id = ?' : '';
+  const orderClause = ' ORDER BY timestamp';
+
+  const params = locationId ? [startDate, endDate, locationId] : [startDate, endDate];
   
   db.all(
-    'SELECT * FROM sensor_readings WHERE DATE(timestamp) BETWEEN ? AND ? ORDER BY timestamp',
-    [startDate, endDate],
+    baseQuery + whereLocation + orderClause,
+    params,
     (err, rows) => {
       if (err) {
         res.status(500).json({ error: 'Failed to fetch readings' });
@@ -518,10 +774,17 @@ app.get('/api/readings/range', (req, res) => {
 // Get daily statistics
 app.get('/api/stats/daily', (req, res) => {
   const days = req.query.days || 30;
+  const locationId = req.query.location_id ? parseInt(req.query.location_id, 10) : null;
+
+  const baseQuery = 'SELECT * FROM daily_stats';
+  const whereClause = locationId ? ' WHERE location_id = ?' : '';
+  const orderLimit = ' ORDER BY date DESC LIMIT ?';
+
+  const params = locationId ? [locationId, days] : [days];
   
   db.all(
-    'SELECT * FROM daily_stats ORDER BY date DESC LIMIT ?',
-    [days],
+    baseQuery + whereClause + orderLimit,
+    params,
     (err, rows) => {
       if (err) {
         res.status(500).json({ error: 'Failed to fetch daily stats' });
@@ -535,6 +798,7 @@ app.get('/api/stats/daily', (req, res) => {
 // Get analytics and trends
 app.get('/api/analytics', (req, res) => {
   const period = req.query.period || 'week'; // week, month, year, day
+  const locationId = req.query.location_id ? parseInt(req.query.location_id, 10) : null;
   
   let dateFilter = '';
   switch(period) {
@@ -563,9 +827,10 @@ app.get('/api/analytics', (req, res) => {
       SUM(CASE WHEN risk_level = 'WARNING' THEN 1 ELSE 0 END) as warning_count
     FROM sensor_readings 
     WHERE ${dateFilter}
+      ${locationId ? ' AND location_id = ?' : ''}
     GROUP BY DATE(timestamp)
     ORDER BY date DESC
-  `, (err, rows) => {
+  `, locationId ? [locationId] : [], (err, rows) => {
     if (err) {
       res.status(500).json({ error: 'Failed to fetch analytics' });
     } else {
@@ -590,8 +855,11 @@ app.get('/api/analytics', (req, res) => {
 });
 
 // Update daily statistics
-function updateDailyStats() {
+function updateDailyStats(locationId = null) {
   const today = new Date().toISOString().split('T')[0];
+  
+  const whereClause = locationId ? `WHERE DATE(timestamp) = ? AND location_id = ?` : `WHERE DATE(timestamp) = ?`;
+  const params = locationId ? [today, locationId] : [today];
   
   db.all(`
     SELECT 
@@ -601,8 +869,8 @@ function updateDailyStats() {
       COUNT(*) as reading_count,
       SUM(CASE WHEN risk_level != 'SAFE' THEN 1 ELSE 0 END) as risk_hours
     FROM sensor_readings 
-    WHERE DATE(timestamp) = ?
-  `, [today], (err, rows) => {
+    ${whereClause}
+  `, params, (err, rows) => {
     if (err) {
       console.error('Error calculating daily stats:', err);
       return;
@@ -612,9 +880,9 @@ function updateDailyStats() {
     
     db.run(`
       INSERT OR REPLACE INTO daily_stats 
-      (date, avg_distance, min_distance, max_distance, reading_count, risk_hours)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `, [today, stats.avg_distance, stats.min_distance, stats.max_distance, stats.reading_count, stats.risk_hours]);
+      (date, location_id, avg_distance, min_distance, max_distance, reading_count, risk_hours)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, [today, locationId || null, stats.avg_distance, stats.min_distance, stats.max_distance, stats.reading_count, stats.risk_hours]);
   });
 }
 

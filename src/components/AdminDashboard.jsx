@@ -1,4 +1,15 @@
 import { useState, useEffect } from 'react'
+import { 
+  getArduinoStatus, 
+  connectArduino, 
+  disconnectArduino,
+  getSMSSettings,
+  updateSMSSettings,
+  getAlertSettings,
+  updateAlertSettings,
+  sendTestSMS,
+  sendAlert
+} from '../utils/api'
 
 const AdminDashboard = ({ onBack, onAdminLogin, onAdminLogout }) => {
   const [isAuthenticated, setIsAuthenticated] = useState(false)
@@ -11,6 +22,24 @@ const AdminDashboard = ({ onBack, onAdminLogin, onAdminLogout }) => {
   const [stats, setStats] = useState({})
   const [loading, setLoading] = useState(false)
   const [message, setMessage] = useState('')
+
+  // Sensors / Arduino state
+  const [arduinoStatus, setArduinoStatus] = useState({ isConnected: false, connectionInfo: null })
+
+  // SMS settings state
+  const [smsSettings, setSmsSettings] = useState({
+    enabled: false,
+    dangerEnabled: true,
+    warningEnabled: false,
+    safeEnabled: false
+  })
+  const [alertSettings, setAlertSettings] = useState({
+    phone: '9779860809730',
+    cooldown: 300000
+  })
+  const [editingPhone, setEditingPhone] = useState(false)
+  const [tempPhone, setTempPhone] = useState('')
+  const [smsStatusMessage, setSmsStatusMessage] = useState('')
 
   // Location form state
   const [locationForm, setLocationForm] = useState({
@@ -84,6 +113,45 @@ const AdminDashboard = ({ onBack, onAdminLogin, onAdminLogout }) => {
       setMessage('Failed to load dashboard data: ' + error.message)
     }
   }
+
+  const loadSensorsAndSMSConfig = async () => {
+    try {
+      // Arduino status
+      try {
+        const status = await getArduinoStatus()
+        if (status.success) {
+          setArduinoStatus({ isConnected: status.isConnected, connectionInfo: status.connectionInfo })
+        }
+      } catch (error) {
+        console.error('Failed to load Arduino status:', error)
+      }
+
+      // SMS auto-alert settings
+      try {
+        const settings = await getSMSSettings()
+        setSmsSettings(settings)
+      } catch (error) {
+        console.error('Failed to load SMS settings:', error)
+      }
+
+      // Alert phone/cooldown
+      try {
+        const settings = await getAlertSettings()
+        setAlertSettings(settings)
+        setTempPhone(settings.phone)
+      } catch (error) {
+        console.error('Failed to load alert settings:', error)
+      }
+    } catch (error) {
+      console.error('Failed to load sensors/SMS config:', error)
+    }
+  }
+
+  useEffect(() => {
+    if (isAuthenticated) {
+      loadSensorsAndSMSConfig()
+    }
+  }, [isAuthenticated])
 
   const handleAddLocation = async (e) => {
     e.preventDefault()
@@ -201,6 +269,102 @@ const AdminDashboard = ({ onBack, onAdminLogin, onAdminLogout }) => {
       }
     } catch (error) {
       setMessage('Failed to delete contact: ' + error.message)
+    }
+  }
+
+  const handleConnectArduino = async (locationId) => {
+    if (!locationId) {
+      setMessage('Please select a location to attach the Arduino to.')
+      return
+    }
+    try {
+      setLoading(true)
+      const result = await connectArduino(null, locationId)
+      if (result.success) {
+        setArduinoStatus({ isConnected: true, connectionInfo: result.status?.connectionInfo || null })
+        setMessage(`✅ Arduino connected for location ID ${result.location_id || locationId}`)
+      } else {
+        setMessage('❌ Failed to connect Arduino: ' + (result.error || 'Unknown error'))
+      }
+    } catch (error) {
+      console.error('Arduino connect error:', error)
+      setMessage('❌ Failed to connect Arduino: ' + error.message)
+    } finally {
+      setLoading(false)
+      setTimeout(() => setMessage(''), 3000)
+    }
+  }
+
+  const handleDisconnectArduino = async () => {
+    try {
+      setLoading(true)
+      const result = await disconnectArduino()
+      if (result.success) {
+        setArduinoStatus({ isConnected: false, connectionInfo: null })
+        setMessage('✅ Arduino disconnected.')
+      } else {
+        setMessage('❌ Failed to disconnect Arduino: ' + (result.error || 'Unknown error'))
+      }
+    } catch (error) {
+      console.error('Arduino disconnect error:', error)
+      setMessage('❌ Failed to disconnect Arduino: ' + error.message)
+    } finally {
+      setLoading(false)
+      setTimeout(() => setMessage(''), 3000)
+    }
+  }
+
+  const handleSendTestSMSFromDashboard = async () => {
+    setSmsStatusMessage('Sending test SMS...')
+    try {
+      await sendTestSMS(alertSettings.phone, 'Hi from Landslide Monitor! System is working.')
+      setSmsStatusMessage('✅ Test SMS sent successfully!')
+    } catch (error) {
+      setSmsStatusMessage('❌ Failed to send test SMS: ' + error.message)
+    } finally {
+      setTimeout(() => setSmsStatusMessage(''), 3000)
+    }
+  }
+
+  const handleSendAlertFromDashboard = async () => {
+    setSmsStatusMessage('Sending manual alert...')
+    try {
+      // Use a generic distance/risk for manual dashboard alert
+      await sendAlert(alertSettings.phone, 0, 'DANGER')
+      setSmsStatusMessage('✅ DANGER alert sent successfully!')
+    } catch (error) {
+      setSmsStatusMessage('❌ Failed to send alert: ' + error.message)
+    } finally {
+      setTimeout(() => setSmsStatusMessage(''), 3000)
+    }
+  }
+
+  const handleSMSSettingsChange = async (newSettings) => {
+    try {
+      setSmsStatusMessage('Updating SMS settings...')
+      const updated = await updateSMSSettings(newSettings)
+      setSmsSettings(updated)
+      setSmsStatusMessage('✅ SMS settings updated!')
+    } catch (error) {
+      console.error('Failed to update SMS settings:', error)
+      setSmsStatusMessage('❌ Failed to update settings: ' + error.message)
+    } finally {
+      setTimeout(() => setSmsStatusMessage(''), 3000)
+    }
+  }
+
+  const handlePhoneUpdate = async () => {
+    try {
+      setSmsStatusMessage('Updating phone number...')
+      const updated = await updateAlertSettings({ phone: tempPhone })
+      setAlertSettings(updated)
+      setEditingPhone(false)
+      setSmsStatusMessage('✅ Phone number updated!')
+    } catch (error) {
+      console.error('Failed to update phone number:', error)
+      setSmsStatusMessage('❌ Failed to update phone number: ' + error.message)
+    } finally {
+      setTimeout(() => setSmsStatusMessage(''), 3000)
     }
   }
 
@@ -591,6 +755,19 @@ const AdminDashboard = ({ onBack, onAdminLogin, onAdminLogout }) => {
                       Contacts
                     </button>
                     <button
+                      onClick={() => handleConnectArduino(location.id)}
+                      style={{
+                        padding: '8px 15px',
+                        background: '#10b981',
+                        color: 'white',
+                        border: 'none',
+                        borderRadius: '5px',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      Set Arduino
+                    </button>
+                    <button
                       onClick={() => handleDeleteLocation(location.id)}
                       style={{
                         padding: '8px 15px',
@@ -752,6 +929,7 @@ const AdminDashboard = ({ onBack, onAdminLogin, onAdminLogout }) => {
           )}
         </div>
       )}
+
     </div>
   )
 }

@@ -3,6 +3,7 @@ class ArduinoConnection {
   constructor() {
     this.port = null;
     this.reader = null;
+    this.readableStreamClosed = null;
     this.isConnected = false;
     this.onDataCallback = null;
   }
@@ -52,38 +53,62 @@ class ArduinoConnection {
 
     try {
       const textDecoder = new TextDecoderStream();
-      const readableStreamClosed = this.port.readable.pipeTo(textDecoder.writable);
+      this.readableStreamClosed = this.port.readable.pipeTo(textDecoder.writable);
       this.reader = textDecoder.readable.getReader();
 
-      // Read data continuously
-      while (true) {
-        const { value, done } = await this.reader.read();
-        if (done) break;
+      console.log('📡 Started reading from Arduino...');
 
-        // Process incoming data
-        const lines = value.split('\n');
-        lines.forEach(line => {
-          const trimmed = line.trim();
+      // Read data continuously
+      while (this.isConnected) {
+        try {
+          const { value, done } = await this.reader.read();
           
-          // Parse your Arduino's output format: "X cm"
-          if (trimmed.includes(' cm')) {
-            const cmMatch = trimmed.match(/(\d+(?:\.\d+)?)\s*cm/);
-            if (cmMatch) {
-              const distance = parseFloat(cmMatch[1]);
-              if (this.onDataCallback && distance > 0) {
-                this.onDataCallback({
-                  distance: distance,
-                  time: new Date().toLocaleTimeString(),
-                  timestamp: Date.now()
-                });
+          if (done) {
+            console.log('⚠️ Reader done, stream closed');
+            break;
+          }
+
+          if (!value) continue;
+
+          console.log('📥 Raw data received:', value);
+
+          // Process incoming data
+          const lines = value.split('\n');
+          lines.forEach(line => {
+            const trimmed = line.trim();
+            
+            if (!trimmed) return; // Skip empty lines
+            
+            console.log('Processing line:', trimmed);
+            
+            // Parse your Arduino's output format: "X cm"
+            if (trimmed.includes(' cm')) {
+              const cmMatch = trimmed.match(/(\d+(?:\.\d+)?)\s*cm/);
+              if (cmMatch) {
+                const distance = parseFloat(cmMatch[1]);
+                console.log('✅ Parsed distance:', distance, 'cm');
+                
+                if (this.onDataCallback && distance > 0 && distance < 400) { // Valid range for HC-SR04
+                  this.onDataCallback({
+                    distance: distance,
+                    time: new Date().toLocaleTimeString(),
+                    timestamp: Date.now()
+                  });
+                }
               }
             }
-          }
-        });
+          });
+        } catch (readError) {
+          console.error('❌ Error in read loop:', readError);
+          // Continue reading even if one read fails
+          if (!this.isConnected) break;
+        }
       }
     } catch (error) {
-      console.error('Error reading from Arduino:', error);
+      console.error('❌ Fatal error reading from Arduino:', error);
       this.isConnected = false;
+    } finally {
+      console.log('🔌 Reading loop ended');
     }
   }
 
@@ -93,18 +118,38 @@ class ArduinoConnection {
 
   async disconnect() {
     try {
+      console.log('🔌 Disconnecting from Arduino...');
+      this.isConnected = false;
+      
       if (this.reader) {
-        await this.reader.cancel();
+        try {
+          await this.reader.cancel();
+        } catch (e) {
+          console.log('Reader cancel error (expected):', e.message);
+        }
         this.reader = null;
       }
+      
+      if (this.readableStreamClosed) {
+        try {
+          await this.readableStreamClosed.catch(() => {}); // Ignore errors
+        } catch (e) {
+          console.log('Stream close error (expected):', e.message);
+        }
+      }
+      
       if (this.port) {
-        await this.port.close();
+        try {
+          await this.port.close();
+        } catch (e) {
+          console.log('Port close error:', e.message);
+        }
         this.port = null;
       }
-      this.isConnected = false;
-      console.log('Disconnected from Arduino');
+      
+      console.log('✅ Disconnected from Arduino');
     } catch (error) {
-      console.error('Error disconnecting:', error);
+      console.error('❌ Error disconnecting:', error);
     }
   }
 

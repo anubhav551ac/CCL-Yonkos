@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
-import ArduinoConnection from '../utils/arduinoConnection'
 import { generateMockData } from '../utils/mockData'
-import { saveReading, getAnalytics, sendTestSMS, sendAlert, getSMSSettings, updateSMSSettings, getAlertSettings, updateAlertSettings } from '../utils/api'
+import { saveReading, getAnalytics, sendTestSMS, sendAlert, getSMSSettings, updateSMSSettings, getAlertSettings, updateAlertSettings, getRecentReadings, getArduinoPorts, connectArduino, disconnectArduino, getArduinoStatus } from '../utils/api'
 
 const SlopeMonitoring = ({ location, onBack, isAdminMode = false }) => {
   const [sensorData, setSensorData] = useState([])
@@ -34,65 +33,171 @@ const SlopeMonitoring = ({ location, onBack, isAdminMode = false }) => {
   const [tempPhone, setTempPhone] = useState('')
   const arduinoRef = useRef(null)
 
-  const handleArduinoData = async (reading) => {
-    setCurrentDistance(reading.distance)
-    setSensorData(prev => {
-      const updated = [...prev, reading].slice(-50) // Keep more readings for hill visualization
-      return updated
-    })
-
-    // Add to pending readings for bulk save
-    setPendingReadings(prev => [...prev, reading])
+  // Load recent readings from database for this specific location
+  const loadRecentReadings = async () => {
+    try {
+      console.log('📊 Loading recent readings from database...');
+      const readings = await getRecentReadings(50, location?.id || null);
+      
+      console.log('📥 Raw readings response:', readings);
+      
+      // Handle both array response and object response
+      const readingsArray = Array.isArray(readings) ? readings : (readings.readings || []);
+      
+      if (readingsArray && readingsArray.length > 0) {
+        // Convert database readings to sensor data format (timestamps are already in Nepal time)
+        const formattedReadings = readingsArray.map(r => {
+          const date = new Date(r.timestamp);
+          
+          return {
+            distance: r.distance,
+            time: date.toLocaleTimeString('en-US', {
+              hour12: true,
+              hour: '2-digit',
+              minute: '2-digit',
+              second: '2-digit'
+            }),
+            timestamp: date.getTime()
+          };
+        });
+        
+        setSensorData(formattedReadings);
+        setCurrentDistance(formattedReadings[0]?.distance || 0);
+        setIsConnected(true);
+        console.log(`✅ Loaded ${formattedReadings.length} readings from database`);
+        console.log('📊 Latest reading:', formattedReadings[0]);
+      } else {
+        console.log('📊 No readings found in database');
+        setSensorData([]);
+        setCurrentDistance(0);
+        setIsConnected(false);
+      }
+    } catch (error) {
+      console.error('❌ Failed to load recent readings:', error);
+      setSensorData([]);
+      setCurrentDistance(0);
+      setIsConnected(false);
+    }
   }
 
-  // Bulk save readings every 30 seconds
+  // Load data on mount for non-admin users
   useEffect(() => {
-    const interval = setInterval(async () => {
-      if (pendingReadings.length > 0) {
-        try {
-          for (const reading of pendingReadings) {
-            await saveReading(reading.distance)
-          }
-          setBulkSaveCount(prev => prev + pendingReadings.length)
-          console.log(`📊 Bulk saved ${pendingReadings.length} readings. Total saved: ${bulkSaveCount + pendingReadings.length}`)
-          setPendingReadings([])
-        } catch (error) {
-          console.error('Failed to bulk save readings:', error)
-        }
-      }
-    }, 30000)
+    if (!isAdminMode) {
+      loadRecentReadings()
+      // Refresh data every 30 seconds for non-admin users
+      const interval = setInterval(loadRecentReadings, 30000)
+      return () => clearInterval(interval)
+    }
+  }, [isAdminMode])
 
+  // Load recent readings from database for all users (both admin and non-admin)
+  useEffect(() => {
+    loadRecentReadings()
+    // Refresh data every 5 seconds to show latest readings
+    const interval = setInterval(loadRecentReadings, 5000)
     return () => clearInterval(interval)
-  }, [pendingReadings, bulkSaveCount])
+  }, [])
 
   const connectToArduino = async () => {
     try {
-      if (arduinoRef.current) {
-        await arduinoRef.current.disconnect();
+      console.log('🔌 Connecting to Arduino via server...')
+      
+      // First check if server is running
+      try {
+        const statusCheck = await fetch('http://localhost:5000/api/arduino/status')
+        if (!statusCheck.ok) {
+          throw new Error(`Server not responding: ${statusCheck.status}`)
+        }
+        console.log('✅ Server is running, checking available ports...')
+        
+        // Check available ports
+        const portsResponse = await fetch('http://localhost:5000/api/arduino/ports')
+        const portsData = await portsResponse.json()
+        console.log('📋 Available Arduino ports:', portsData.ports)
+        
+        if (portsData.ports.length === 0) {
+          alert('No Arduino ports detected. Please check:\n1. Arduino is connected via USB\n2. Arduino drivers are installed\n3. Arduino IDE Serial Monitor is closed')
+          return
+        }
+        
+      } catch (serverCheck) {
+        console.error('❌ Server is not running or Arduino endpoints not available:', serverCheck.message)
+        alert('Server is not running with Arduino support. Please:\n1. Run "cd server && npm install"\n2. Run "npm run dev" in server directory\n3. Try connecting again')
+        return
       }
       
-      arduinoRef.current = new ArduinoConnection()
-      const connected = await arduinoRef.current.connect()
+      // Try server-side connection, binding Arduino readings to this location
+      const result = await connectArduino(null, location?.id || null)
       
-      if (connected) {
+      if (result.success) {
         setUseRealArduino(true)
         setIsConnected(true)
-        arduinoRef.current.onData(handleArduinoData)
-        alert('Arduino connected successfully!')
+        console.log('✅ Arduino connected successfully via server!')
+        alert('Arduino connected successfully! Data will be collected continuously even after page refresh.')
+      } else {
+        throw new Error(result.error || 'Server connection failed')
       }
+      
     } catch (error) {
-      console.error('Failed to connect to Arduino:', error)
-      alert(`Connection failed: ${error.message}`)
+      console.error('❌ Failed to connect to Arduino:', error)
+      
+      if (error.message.includes('404') || error.message.includes('Server not responding')) {
+        alert('Arduino server endpoints not available. Please:\n1. Install packages: cd server && npm install\n2. Restart server: npm run dev\n3. Try again')
+      } else {
+        alert(`Connection failed: ${error.message}\n\nCheck server console for detailed error logs.`)
+      }
     }
   }
 
-  const disconnectArduino = async () => {
-    if (arduinoRef.current) {
-      await arduinoRef.current.disconnect()
-      setUseRealArduino(false)
-      setIsConnected(false)
+  const disconnectArduinoHandler = async () => {
+    try {
+      console.log('🔌 Disconnecting Arduino via server...')
+      const result = await disconnectArduino()
+      
+      if (result.success) {
+        setUseRealArduino(false)
+        setIsConnected(false)
+        console.log('✅ Arduino disconnected successfully!')
+        alert('Arduino disconnected.')
+      } else {
+        throw new Error(result.error || 'Disconnect failed')
+      }
+    } catch (error) {
+      console.error('❌ Failed to disconnect Arduino:', error)
+      alert(`Disconnect failed: ${error.message}`)
     }
   }
+
+  // Check Arduino status periodically
+  useEffect(() => {
+    const checkArduinoStatus = async () => {
+      try {
+        const status = await getArduinoStatus()
+        if (status.success) {
+          const attachedLocationId = status.location_id || null
+          const isForThisLocation = status.isConnected && (!location?.id || location.id === attachedLocationId)
+
+          setIsConnected(isForThisLocation)
+
+          if (isForThisLocation && !useRealArduino) {
+            setUseRealArduino(true)
+            console.log('📡 Arduino connection detected for this location from server')
+          } else if (!isForThisLocation && useRealArduino) {
+            setUseRealArduino(false)
+            console.log('🔌 Arduino not attached to this location (or disconnected)')
+          }
+        }
+      } catch (error) {
+        console.error('Error checking Arduino status:', error)
+      }
+    }
+
+    // Check status immediately and then every 5 seconds
+    checkArduinoStatus()
+    const interval = setInterval(checkArduinoStatus, 5000)
+    
+    return () => clearInterval(interval)
+  }, [useRealArduino, location?.id])
 
   const handleSendTestSMS = async () => {
     setSmsStatus('Sending test SMS...')
@@ -121,7 +226,7 @@ const SlopeMonitoring = ({ location, onBack, isAdminMode = false }) => {
 
   const loadAnalytics = async () => {
     try {
-      const data = await getAnalytics(selectedPeriod)
+      const data = await getAnalytics(selectedPeriod, location?.id || null)
       setAnalytics(data)
       
       // Perform trend analysis on real data only
@@ -138,9 +243,9 @@ const SlopeMonitoring = ({ location, onBack, isAdminMode = false }) => {
     try {
       // Get data for different periods
       const [dailyData, weeklyData, monthlyData] = await Promise.all([
-        getAnalytics('day'),
-        getAnalytics('week'), 
-        getAnalytics('month')
+        getAnalytics('day', location?.id || null),
+        getAnalytics('week', location?.id || null), 
+        getAnalytics('month', location?.id || null)
       ])
 
       const analysis = {
@@ -347,47 +452,57 @@ const SlopeMonitoring = ({ location, onBack, isAdminMode = false }) => {
     loadAlertSettings()
   }, [selectedPeriod])
 
-  useEffect(() => {
-    return () => {
-      if (arduinoRef.current) {
-        arduinoRef.current.disconnect()
-      }
-    }
-  }, [])
-
   const getRiskLevel = (distance) => {
     if (distance < 50) return { level: 'DANGER', color: '#ef4444' }
     if (distance < 100) return { level: 'WARNING', color: '#f59e0b' }
     return { level: 'SAFE', color: '#10b981' }
   }
 
-  // Generate hill visualization points - Linear slope with sensor perpendicular to hill
+  // Generate hill visualization points - Realistic rough slope based on sensor readings
   const generateHillPoints = () => {
     if (sensorData.length < 3) return { hillPoints: [], sensorPosition: null }
     
     const width = 600
     const height = 250
-    const readings = sensorData.slice(-10) // Use last 10 readings for smoother line
+    const readings = sensorData.slice(-20) // Use last 20 readings for realistic terrain
     
-    // Calculate average distance to determine slope
+    // Calculate average distance
     const avgDistance = readings.reduce((sum, r) => sum + r.distance, 0) / readings.length
     
-    // Create linear slope: y = -mx + c
-    // Slope steepness based on distance (closer = steeper)
-    const slope = Math.max(0.3, Math.min(2, (200 - avgDistance) / 100)) // m value
-    const yIntercept = height * 0.8 // c value (starting height)
-    
-    // Generate hill line points
+    // Generate realistic hill profile with natural variations
     const hillPoints = []
-    for (let x = 0; x <= width; x += 20) {
-      const y = Math.max(50, yIntercept - (slope * x / 2)) // Linear equation
+    const numPoints = 30 // More points for smoother curve
+    
+    for (let i = 0; i <= numPoints; i++) {
+      const x = (width / numPoints) * i
+      
+      // Base slope - descending from left to right
+      const baseSlope = height * 0.75 - (x / width) * (height * 0.4)
+      
+      // Add natural terrain variations using multiple sine waves
+      const variation1 = Math.sin(x / 50) * 15 // Large undulations
+      const variation2 = Math.sin(x / 20) * 8  // Medium bumps
+      const variation3 = Math.sin(x / 10) * 4  // Small roughness
+      
+      // Add some randomness based on actual sensor readings
+      const readingIndex = Math.floor((i / numPoints) * Math.min(readings.length - 1, 10))
+      const readingVariation = readings[readingIndex] ? (readings[readingIndex].distance - avgDistance) * 0.3 : 0
+      
+      // Combine all variations
+      const y = Math.max(40, Math.min(height - 20, 
+        baseSlope + variation1 + variation2 + variation3 + readingVariation
+      ))
+      
       hillPoints.push({ x, y })
     }
     
-    // Sensor position (perpendicular to slope at center)
+    // Sensor position at center, perpendicular to hill surface
     const centerX = width / 2
-    const hillY = yIntercept - (slope * centerX / 2)
-    const sensorY = Math.max(20, hillY - avgDistance * 0.8) // Sensor above hill
+    const centerIndex = Math.floor(hillPoints.length / 2)
+    const hillY = hillPoints[centerIndex]?.y || height * 0.6
+    
+    // Position sensor based on average distance reading
+    const sensorY = Math.max(20, hillY - avgDistance * 0.8)
     
     return {
       hillPoints,
@@ -441,6 +556,89 @@ const SlopeMonitoring = ({ location, onBack, isAdminMode = false }) => {
         </div>
       </div>
 
+      {/* Data Source Indicator for Non-Admin Users */}
+      {!isAdminMode && sensorData.length > 0 && (
+        <div style={{ 
+          display: 'flex', 
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '15px',
+          background: 'rgba(16, 185, 129, 0.15)',
+          borderRadius: '15px',
+          marginBottom: '30px',
+          gap: '15px',
+          flexWrap: 'wrap'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <span style={{ fontSize: '16px', fontWeight: '600' }}>📡 Live Data</span>
+            <span style={{ fontSize: '14px', opacity: 0.9 }}>
+              Viewing real-time sensor readings from this location (updates every 5s)
+            </span>
+          </div>
+          <button
+            onClick={loadRecentReadings}
+            style={{
+              padding: '8px 16px',
+              background: 'rgba(16, 185, 129, 0.8)',
+              color: 'white',
+              border: 'none',
+              borderRadius: '8px',
+              cursor: 'pointer',
+              fontSize: '14px',
+              fontWeight: '600',
+              transition: 'all 0.3s ease'
+            }}
+            onMouseOver={(e) => {
+              e.target.style.background = 'rgba(16, 185, 129, 1)'
+              e.target.style.transform = 'translateY(-1px)'
+            }}
+            onMouseOut={(e) => {
+              e.target.style.background = 'rgba(16, 185, 129, 0.8)'
+              e.target.style.transform = 'translateY(0)'
+            }}
+          >
+            🔄 Refresh Now
+          </button>
+        </div>
+      )}
+
+      {/* No Data Indicator */}
+      {!isAdminMode && sensorData.length === 0 && (
+        <div style={{ 
+          display: 'flex', 
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '15px',
+          background: 'rgba(245, 158, 11, 0.15)',
+          borderRadius: '15px',
+          marginBottom: '30px',
+          gap: '15px',
+          flexWrap: 'wrap'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <span style={{ fontSize: '16px', fontWeight: '600' }}>⏳ No Data</span>
+            <span style={{ fontSize: '14px', opacity: 0.9 }}>
+              No sensor readings available yet. Admin needs to connect Arduino first.
+            </span>
+          </div>
+          <button
+            onClick={loadRecentReadings}
+            style={{
+              padding: '8px 16px',
+              background: 'rgba(245, 158, 11, 0.8)',
+              color: 'white',
+              border: 'none',
+              borderRadius: '8px',
+              cursor: 'pointer',
+              fontSize: '14px',
+              fontWeight: '600'
+            }}
+          >
+            🔄 Check Again
+          </button>
+        </div>
+      )}
+
       {/* Arduino Connection Status - Admin Only */}
       {isAdminMode && (
         <div style={{ 
@@ -460,7 +658,7 @@ const SlopeMonitoring = ({ location, onBack, isAdminMode = false }) => {
                 <>
                   <span style={{ fontSize: '16px', fontWeight: '600' }}>🔌 Arduino Connected</span>
                   <button 
-                    onClick={disconnectArduino}
+                    onClick={disconnectArduinoHandler}
                     style={{ 
                       padding: '10px 20px', 
                       background: '#ef4444', 
@@ -501,6 +699,24 @@ const SlopeMonitoring = ({ location, onBack, isAdminMode = false }) => {
               </>
             )}
           </div>
+
+          {/* Arduino Status Indicator */}
+          {useRealArduino && (
+            <div style={{
+              padding: '12px 20px',
+              background: 'rgba(16, 185, 129, 0.2)',
+              borderRadius: '10px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '10px',
+              fontSize: '14px',
+              fontWeight: '600',
+              justifyContent: 'center'
+            }}>
+              <span>🔌</span>
+              <span>Arduino connected - Data being collected and saved automatically</span>
+            </div>
+          )}
 
           {/* Mock Data Controls - Only show when not using real Arduino */}
           {!useRealArduino && (
@@ -558,9 +774,9 @@ const SlopeMonitoring = ({ location, onBack, isAdminMode = false }) => {
             maxWidth: '600px'
           }}>
             {useRealArduino 
-              ? 'Real Arduino sensor data is being used for measurements'
+              ? '✅ Real Arduino sensor data is being collected by server and saved to database automatically'
               : useMockData 
-                ? 'Mock data is being generated for demonstration purposes'
+                ? '✅ Mock data is being generated and saved to database for demonstration'
                 : 'No data is being generated. Enable mock data or connect Arduino to see readings'
             }
           </div>
@@ -657,7 +873,7 @@ const SlopeMonitoring = ({ location, onBack, isAdminMode = false }) => {
             Data Points
           </h3>
           <div style={{ fontSize: '3.5rem', fontWeight: '800', color: '#3b82f6', marginBottom: '15px', lineHeight: '1' }}>
-            {bulkSaveCount + pendingReadings.length}
+            {sensorData.length}
           </div>
           <div style={{ fontSize: '1.2rem', color: '#94a3b8', fontWeight: '500' }}>total readings</div>
         </div>
@@ -843,7 +1059,7 @@ const SlopeMonitoring = ({ location, onBack, isAdminMode = false }) => {
             🏔️ Real-time Slope Analysis
           </h3>
           <p style={{ fontSize: '1rem', color: '#64748b', maxWidth: '600px', margin: '0 auto' }}>
-            Linear slope representation with ultrasonic sensor positioned perpendicular to the hill surface
+            Realistic terrain visualization with natural slope variations based on ultrasonic sensor measurements
           </p>
         </div>
         
@@ -1001,16 +1217,16 @@ const SlopeMonitoring = ({ location, onBack, isAdminMode = false }) => {
               gap: '20px'
             }}>
               <div style={{ textAlign: 'center' }}>
-                <div style={{ fontSize: '0.9rem', color: '#64748b', marginBottom: '5px' }}>Slope Equation</div>
-                <div style={{ fontSize: '1.1rem', fontWeight: 'bold', color: '#1e293b' }}>y = -mx + c</div>
+                <div style={{ fontSize: '0.9rem', color: '#64748b', marginBottom: '5px' }}>Terrain Type</div>
+                <div style={{ fontSize: '1.1rem', fontWeight: 'bold', color: '#1e293b' }}>Natural Slope</div>
               </div>
               <div style={{ textAlign: 'center' }}>
                 <div style={{ fontSize: '0.9rem', color: '#64748b', marginBottom: '5px' }}>Sensor Position</div>
                 <div style={{ fontSize: '1.1rem', fontWeight: 'bold', color: '#1e293b' }}>Perpendicular</div>
               </div>
               <div style={{ textAlign: 'center' }}>
-                <div style={{ fontSize: '0.9rem', color: '#64748b', marginBottom: '5px' }}>Measurement Type</div>
-                <div style={{ fontSize: '1.1rem', fontWeight: 'bold', color: '#1e293b' }}>Distance to Surface</div>
+                <div style={{ fontSize: '0.9rem', color: '#64748b', marginBottom: '5px' }}>Visualization</div>
+                <div style={{ fontSize: '1.1rem', fontWeight: 'bold', color: '#1e293b' }}>Real-time Data</div>
               </div>
             </div>
           </div>
